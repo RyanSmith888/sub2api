@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -1064,13 +1065,7 @@ func normalizeClaudeOAuthRequestBody(body []byte, modelID string, opts claudeOAu
 		}
 	}
 
-	// 确保 tools 字段存在（即使为空数组）
-	if !gjson.GetBytes(out, "tools").Exists() {
-		if next, ok := setJSONRawBytes(out, "tools", []byte("[]")); ok {
-			out = next
-			modified = true
-		}
-	}
+	// 不再强制注入空 tools 数组，真实 Claude Code 在不使用工具时不发送此字段
 
 	if opts.injectMetadata && opts.metadataUserID != "" {
 		if next, changed := ensureClaudeOAuthMetadataUserID(out, opts.metadataUserID); changed {
@@ -3610,6 +3605,147 @@ func hasClaudeCodePrefix(text string) bool {
 	return false
 }
 
+// extractFirstUserMessageTextFromAnthropicMessages 从 AnthropicMessage 切片中提取第一条用户消息文本。
+// 用于 chat completions / responses API 路径的 billing header 计算。
+func extractFirstUserMessageTextFromAnthropicMessages(messages []apicompat.AnthropicMessage) string {
+	for _, msg := range messages {
+		if msg.Role != "user" {
+			continue
+		}
+		// Content 是 json.RawMessage，尝试解析为字符串或数组
+		var contentStr string
+		if err := json.Unmarshal(msg.Content, &contentStr); err == nil {
+			return contentStr
+		}
+		var blocks []map[string]any
+		if err := json.Unmarshal(msg.Content, &blocks); err == nil {
+			for _, block := range blocks {
+				if block["type"] == "text" {
+					if text, ok := block["text"].(string); ok {
+						return text
+					}
+				}
+			}
+		}
+		return ""
+	}
+	return ""
+}
+
+// convertAnthropicMessagesToAny 将 AnthropicMessage 转为 []any 格式以适配 injectBillingHeader。
+// 只构造包含第一条用户消息的最小 slice，因为 billing header 只需要第一条用户消息的文本。
+func convertAnthropicMessagesToAny(messages []apicompat.AnthropicMessage, firstMsgText string) []any {
+	if firstMsgText == "" {
+		return nil
+	}
+	return []any{
+		map[string]any{
+			"role":    "user",
+			"content": firstMsgText,
+		},
+	}
+}
+
+// extractFirstUserMessageText 从 parsed.Messages 中提取第一条用户消息的文本内容，
+// 用于计算 billing header 的 fingerprint。
+func extractFirstUserMessageText(messages []any) string {
+	for _, msg := range messages {
+		msgMap, ok := msg.(map[string]any)
+		if !ok {
+			continue
+		}
+		if msgMap["role"] != "user" {
+			continue
+		}
+		content := msgMap["content"]
+		switch v := content.(type) {
+		case string:
+			return v
+		case []any:
+			for _, part := range v {
+				partMap, ok := part.(map[string]any)
+				if !ok {
+					continue
+				}
+				if partMap["type"] == "text" {
+					if text, ok := partMap["text"].(string); ok {
+						return text
+					}
+				}
+			}
+		}
+		return ""
+	}
+	return ""
+}
+
+// injectBillingHeader 在 system 开头注入 x-anthropic-billing-header 归属头。
+// 真实 Claude Code 将此字符串作为 system 的第一个 text block 发送。
+func injectBillingHeader(body []byte, system any, messages []any) []byte {
+	firstMsgText := extractFirstUserMessageText(messages)
+	billingHeader := claude.BuildBillingHeader(firstMsgText)
+
+	billingBlock, err := marshalAnthropicSystemTextBlock(billingHeader, false)
+	if err != nil {
+		logger.LegacyPrintf("service.gateway", "Warning: failed to build billing header block: %v", err)
+		return body
+	}
+
+	system = normalizeSystemParam(system)
+
+	var items [][]byte
+	switch v := system.(type) {
+	case nil:
+		items = [][]byte{billingBlock}
+	case string:
+		if strings.TrimSpace(v) == "" {
+			items = [][]byte{billingBlock}
+		} else {
+			existingBlock, buildErr := marshalAnthropicSystemTextBlock(v, false)
+			if buildErr != nil {
+				return body
+			}
+			items = [][]byte{billingBlock, existingBlock}
+		}
+	case []any:
+		items = make([][]byte, 0, len(v)+1)
+		items = append(items, billingBlock)
+		systemResult := gjson.GetBytes(body, "system")
+		if systemResult.IsArray() {
+			systemResult.ForEach(func(_, item gjson.Result) bool {
+				items = append(items, []byte(item.Raw))
+				return true
+			})
+		} else {
+			for _, item := range v {
+				raw, marshalErr := json.Marshal(item)
+				if marshalErr == nil {
+					items = append(items, raw)
+				}
+			}
+		}
+	}
+
+	if len(items) == 0 {
+		return body
+	}
+
+	systemJSON := []byte("[")
+	for i, item := range items {
+		if i > 0 {
+			systemJSON = append(systemJSON, ',')
+		}
+		systemJSON = append(systemJSON, item...)
+	}
+	systemJSON = append(systemJSON, ']')
+
+	result, err := sjson.SetRawBytes(body, "system", systemJSON)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
 // injectClaudeCodePrompt 在 system 开头注入 Claude Code 提示词
 // 处理 null、字符串、数组三种格式
 func injectClaudeCodePrompt(body []byte, system any) []byte {
@@ -3905,11 +4041,27 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	shouldMimicClaudeCode := account.IsOAuth() && !isClaudeCode
 
 	if shouldMimicClaudeCode {
+		// 注入 billing header 归属头（必须在 Claude Code 系统提示词之前，作为 system 的第一个 block）
+		body = injectBillingHeader(body, parsed.System, parsed.Messages)
+
+		// 重新解析 system（因为 injectBillingHeader 可能已修改 body 中的 system 字段）
+		updatedSystem := parsed.System
+		if sys := gjson.GetBytes(body, "system"); sys.Exists() {
+			switch sys.Type {
+			case gjson.String:
+				updatedSystem = sys.String()
+			default:
+				var s any
+				json.Unmarshal([]byte(sys.Raw), &s)
+				updatedSystem = s
+			}
+		}
+
 		// 智能注入 Claude Code 系统提示词（仅 OAuth/SetupToken 账号需要）
 		// 条件：1) OAuth/SetupToken 账号  2) 不是 Claude Code 客户端  3) 不是 Haiku 模型  4) system 中还没有 Claude Code 提示词
 		if !strings.Contains(strings.ToLower(reqModel), "haiku") &&
-			!systemIncludesClaudeCodePrompt(parsed.System) {
-			body = injectClaudeCodePrompt(body, parsed.System)
+			!systemIncludesClaudeCodePrompt(updatedSystem) {
+			body = injectClaudeCodePrompt(body, updatedSystem)
 		}
 
 		normalizeOpts := claudeOAuthNormalizeOptions{stripSystemCacheControl: true}
@@ -5531,10 +5683,14 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 		applyClaudeOAuthHeaderDefaults(req)
 	}
 
+	// 补充 x-client-request-id（真实 Claude Code 每个请求都会带此 header）
+	if getHeaderRaw(req.Header, "x-client-request-id") == "" {
+		setHeaderRaw(req.Header, "x-client-request-id", uuid.NewString())
+	}
+
 	// Build effective drop set: merge static defaults with dynamic beta policy filter rules
 	policyFilterSet := s.getBetaPolicyFilterSet(ctx, c, account)
 	effectiveDropSet := mergeDropSets(policyFilterSet)
-	effectiveDropWithClaudeCodeSet := mergeDropSets(policyFilterSet, claude.BetaClaudeCode)
 
 	// 处理 anthropic-beta header（OAuth 账号需要包含 oauth beta）
 	if tokenType == "oauth" {
@@ -5545,11 +5701,9 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 			applyClaudeCodeMimicHeaders(req, reqStream)
 
 			incomingBeta := getHeaderRaw(req.Header, "anthropic-beta")
-			// Match real Claude CLI traffic (per mitmproxy reports):
-			// messages requests typically use only oauth + interleaved-thinking.
-			// Also drop claude-code beta if a downstream client added it.
-			requiredBetas := []string{claude.BetaOAuth, claude.BetaInterleavedThinking}
-			setHeaderRaw(req.Header, "anthropic-beta", mergeAnthropicBetaDropping(requiredBetas, incomingBeta, effectiveDropWithClaudeCodeSet))
+			// 真实 Claude Code 始终包含 claude-code beta，不应移除
+			requiredBetas := []string{claude.BetaClaudeCode, claude.BetaOAuth, claude.BetaInterleavedThinking, claude.BetaFineGrainedToolStreaming}
+			setHeaderRaw(req.Header, "anthropic-beta", mergeAnthropicBetaDropping(requiredBetas, incomingBeta, effectiveDropSet))
 		} else {
 			// Claude Code 客户端：尽量透传原始 header，仅补齐 oauth beta
 			clientBetaHeader := getHeaderRaw(req.Header, "anthropic-beta")

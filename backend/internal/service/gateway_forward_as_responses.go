@@ -87,9 +87,24 @@ func (s *GatewayService) ForwardAsResponses(
 	shouldMimicClaudeCode := account.IsOAuth() && !isClaudeCode
 
 	if shouldMimicClaudeCode {
+		// 注入 billing header 归属头
+		firstMsgText := extractFirstUserMessageTextFromAnthropicMessages(anthropicReq.Messages)
+		anthropicBody = injectBillingHeader(anthropicBody, anthropicReq.System, convertAnthropicMessagesToAny(anthropicReq.Messages, firstMsgText))
+
+		// 重新解析 system
+		var updatedSystem any
+		if sys := gjson.GetBytes(anthropicBody, "system"); sys.Exists() {
+			switch sys.Type {
+			case gjson.String:
+				updatedSystem = sys.String()
+			default:
+				json.Unmarshal([]byte(sys.Raw), &updatedSystem)
+			}
+		}
+
 		if !strings.Contains(strings.ToLower(mappedModel), "haiku") &&
-			!systemIncludesClaudeCodePrompt(anthropicReq.System) {
-			anthropicBody = injectClaudeCodePrompt(anthropicBody, anthropicReq.System)
+			!systemIncludesClaudeCodePrompt(updatedSystem) {
+			anthropicBody = injectClaudeCodePrompt(anthropicBody, updatedSystem)
 		}
 	}
 

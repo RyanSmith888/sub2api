@@ -242,6 +242,7 @@ func (s *claudeOAuthService) RefreshToken(ctx context.Context, refreshToken, pro
 		"grant_type":    "refresh_token",
 		"refresh_token": refreshToken,
 		"client_id":     oauth.ClientID,
+		"scope":         "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
 	}
 
 	var tokenResp oauth.TokenResponse
@@ -268,6 +269,8 @@ func (s *claudeOAuthService) RefreshToken(ctx context.Context, refreshToken, pro
 
 func createReqClient(proxyURL string) (*req.Client, error) {
 	// 禁用 CookieJar，确保每次授权都是干净的会话
+	// 保留 ImpersonateChrome() 提供浏览器级 TLS 指纹，
+	// 优于 Go 默认 TLS（更容易被检测为自动化工具）
 	client := req.C().
 		SetTimeout(60 * time.Second).
 		ImpersonateChrome().

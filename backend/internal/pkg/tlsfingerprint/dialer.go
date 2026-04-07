@@ -358,7 +358,7 @@ func buildClientHelloSpecFromProfile(profile *Profile) *utls.ClientHelloSpec {
 		}
 	}
 
-	alpnProtocols := []string{"http/1.1"}
+	alpnProtocols := []string{"h2", "http/1.1"}
 	if profile != nil && len(profile.ALPNProtocols) > 0 {
 		alpnProtocols = profile.ALPNProtocols
 	}

@@ -41,11 +41,11 @@ func TestNormalizeClaudeOAuthRequestBody_PreservesTopLevelFieldOrder(t *testing.
 	resultStr := string(result)
 
 	require.Equal(t, claude.NormalizeModelID("claude-3-5-sonnet-latest"), modelID)
-	assertJSONTokenOrder(t, resultStr, `"alpha"`, `"model"`, `"system"`, `"messages"`, `"omega"`, `"tools"`, `"metadata"`)
+	assertJSONTokenOrder(t, resultStr, `"alpha"`, `"model"`, `"system"`, `"messages"`, `"omega"`, `"metadata"`)
 	require.NotContains(t, resultStr, `"temperature"`)
 	require.NotContains(t, resultStr, `"tool_choice"`)
 	require.Contains(t, resultStr, `"system":"`+claudeCodeSystemPrompt+`"`)
-	require.Contains(t, resultStr, `"tools":[]`)
+	require.NotContains(t, resultStr, `"tools"`)
 	require.Contains(t, resultStr, `"metadata":{"user_id":"user-1"}`)
 }
 
