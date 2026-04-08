@@ -38,9 +38,19 @@ func ComputeFingerprint(messageText string) string {
 	return hex.EncodeToString(hash[:])[:3]
 }
 
+// computeCCH 生成一个基于请求内容的 5 字符伪认证哈希，
+// 用于填充 cch 字段。真实 Claude Code 由 Bun 原生 HTTP 栈计算，
+// 这里用请求内容的 SHA256 衍生值替代以避免全零或缺失。
+func computeCCH(messageText, fingerprint string) string {
+	input := fingerprint + messageText + Version + FingerprintSalt
+	hash := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(hash[:])[:5]
+}
+
 // BuildBillingHeader 构建与 Claude Code 一致的归属头字符串。
-// 格式: x-anthropic-billing-header: cc_version={VERSION}.{FINGERPRINT}; cc_entrypoint=cli;
+// 格式: x-anthropic-billing-header: cc_version={VERSION}.{FINGERPRINT}; cc_entrypoint=cli; cch={HASH};
 func BuildBillingHeader(messageText string) string {
 	fp := ComputeFingerprint(messageText)
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli;", Version, fp)
+	cch := computeCCH(messageText, fp)
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;", Version, fp, cch)
 }
