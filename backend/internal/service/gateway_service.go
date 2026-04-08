@@ -5644,6 +5644,12 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 		}
 	}
 
+	// OAuth mimic 模式：在请求 body 完全构建后计算真实的 CCH 哈希并替换占位符
+	// 算法：xxHash64(body_with_placeholder, seed=0x6E52736AC806831E) & 0xFFFFF
+	if mimicClaudeCode {
+		body = claude.ComputeAndReplaceCCH(body)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -8515,6 +8521,11 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 				}
 			}
 		}
+	}
+
+	// OAuth mimic 模式：计算真实 CCH 哈希
+	if mimicClaudeCode {
+		body = claude.ComputeAndReplaceCCH(body)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(body))
